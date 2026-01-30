@@ -39,6 +39,7 @@ log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
+save_best_to_different = False # if True, save last eval as ckpt.pt, best as ckpt_best.pt
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
@@ -78,6 +79,7 @@ config_keys = [k for k,v in globals().items() if not k.startswith('_') and isins
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
+always_save_checkpoint = True if save_best_to_different else always_save_checkpoint
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -177,6 +179,7 @@ else:
         else:
             print(f"Resuming training from {init_from}")
             ckpt_path = init_from
+            init_from = "resume"
             
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
@@ -295,6 +298,9 @@ while True:
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                if save_best_to_different and loss['val'] < best_val_loss:
+                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt_best.pt'))
+
     if iter_num == 0 and eval_only:
         break
 
