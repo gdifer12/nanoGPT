@@ -298,7 +298,7 @@ while True:
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-                if save_best_to_different and loss['val'] < best_val_loss:
+                if save_best_to_different and losses['val'] < best_val_loss:
                     torch.save(checkpoint, os.path.join(out_dir, 'ckpt_best.pt'))
 
     if iter_num == 0 and eval_only:
