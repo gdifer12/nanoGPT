@@ -68,6 +68,10 @@ decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+# freeze settings
+freeze_n_layers = 0 # freeze first n layers in model.transformer.h
+freeze_embeddings = False # freeze wte and wpe, wte <=> lm_head 
+detach_frozen_prefix = False # not realized yet
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -205,6 +209,28 @@ if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
+
+def apply_freeze(model, freeze_n_layers: int = 0, freeze_embeddings: bool = False):
+    # embeddings (!weight tying -> wte <=> lm_head!)
+    if freeze_embeddings:
+        for p in model.transformer.wte.parameters():
+            p.requires_grad = False
+        for p in model.transformer.wpe.parameters():
+            p.requires_grad = False
+
+    # lower blocks
+    n = len(model.transformer.h)
+    k = max(0, min(freeze_n_layers, n))
+    for i in range(k):
+        for p in model.transformer.h[i].parameters():
+            p.requires_grad = False
+
+# appliying freeze
+apply_freeze(model, freeze_n_layers=freeze_n_layers, freeze_embeddings=freeze_embeddings)
+
+trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+total = sum(p.numel() for p in model.parameters())
+print(f"trainable params: {trainable}/{total} ({100*trainable/total:.2f}%)")
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
