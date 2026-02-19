@@ -224,9 +224,11 @@ def apply_freeze(model, freeze_n_layers: int = 0, freeze_embeddings: bool = Fals
     for i in range(k):
         for p in model.transformer.h[i].parameters():
             p.requires_grad = False
+            
+    return (freeze_n_layers or freeze_embeddings)
 
 # appliying freeze
-apply_freeze(model, freeze_n_layers=freeze_n_layers, freeze_embeddings=freeze_embeddings)
+stop_load_optimizer_state = apply_freeze(model, freeze_n_layers=freeze_n_layers, freeze_embeddings=freeze_embeddings)
 
 trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 total = sum(p.numel() for p in model.parameters())
@@ -237,7 +239,7 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == 'resume':
+if init_from == 'resume' and not stop_load_optimizer_state:
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
 
