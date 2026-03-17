@@ -32,9 +32,23 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # model
-if init_from == 'resume':
-    # init from a model saved in a specific directory
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+if init_from.startswith('gpt2'):
+    # init from a given GPT-2 model
+    model = GPT.from_pretrained(init_from, dict(dropout=0.0))
+else:
+    if init_from == 'resume':
+        print(f"Resuming training from {out_dir}")
+        # resume training from a checkpoint.
+        ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    else:
+        # suppose path to ckpt.pt
+        if not os.path.exists(init_from) or not os.path.isfile(init_from):
+            print(f"Initial model not found on path: {init_from}")
+            exit(1)
+        else:
+            print(f"Resuming training from {init_from}")
+            ckpt_path = init_from
+            init_from = "resume"
     checkpoint = torch.load(ckpt_path, map_location=device)
     gptconf = GPTConfig(**checkpoint['model_args'])
     model = GPT(gptconf)
@@ -44,9 +58,6 @@ if init_from == 'resume':
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
-elif init_from.startswith('gpt2'):
-    # init from a given GPT-2 model
-    model = GPT.from_pretrained(init_from, dict(dropout=0.0))
 
 model.eval()
 model.to(device)
