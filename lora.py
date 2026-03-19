@@ -1,6 +1,6 @@
 # Here is LoRA add-on to the model 
 
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 
 import torch.nn as nn
 
@@ -8,12 +8,36 @@ from model import GPT
 
 @dataclass
 class LoRAConfig:
-    targets: str = "" # from {attn.c_attn, attn.c_proj, mlp.c_fc, mlp.c_proj} divided by commas
+    enable: bool = False
+    targets: str = "" # all or subset of {attn.c_attn, attn.c_proj, mlp.c_fc, mlp.c_proj} divided by commas
     target_layers: str = "all" # "all" or list of python-like slices through commas (example: "1,3:5,6:10:2,12" -> [1, 3, 4, 6, 8, 12])
     rank: int = 8
     alpha: float = 1.0 # scale is alpha/rank 
     bias: bool = False # if True do not freese bias on target (if exists and not freezed)
 
+    # True if optimizer_state can be reused
+    def is_compatible(self, o: 'LoRAConfig', n_layer: int) -> bool:
+        if not o: return False
+        if not self.enable and not o.enable: return True
+        return (
+            self.enable == o.enable,
+            self.targets == o.targets,
+            _parse_target_layers(self.target_layers, n_layer) == _parse_target_layers(o.target_layers, n_layer),
+            self.rank == o.rank,
+            self.bias == o.bias,
+        )
+        
+def lora_config_to_dict(cfg: LoRAConfig | None) -> dict:
+    if not cfg: return dict()
+    return asdict(cfg)
+
+def dict_to_lora_config(d: dict | None) -> LoRAConfig:
+    if not d: return LoRAConfig()
+    cfg = LoRAConfig()
+    for attr, val in d.items():
+        setattr(cfg, attr, val)
+    return cfg
+        
 class LoRALinear(nn.Module):
     def __init__(self, src: nn.Linear, config: LoRAConfig):
         super().__init__()
@@ -87,8 +111,14 @@ TARGETS = {
 }
 
 def apply_LoRA(model: GPT, config: LoRAConfig):
+    if not config.enable:
+        return 0
     layers = _parse_target_layers(config.target_layers, model.config.n_layer)
-    targets = [x.strip() for x in config.targets.split(",") if x.strip()]
+    if config.targets.strip() == "all":
+        targets = TARGETS.keys()    
+    else:
+        targets = [x.strip() for x in config.targets.split(",") if x.strip()]
+    applied_cnt = 0
     for i in layers:
         for target in targets:
             if target not in TARGETS:
@@ -105,3 +135,6 @@ def apply_LoRA(model: GPT, config: LoRAConfig):
                 raise ValueError(f"{target} on layer {i} in not a suitable object")
             
             setattr(parent, attr, LoRALinear(obj, config))
+            applied_cnt += 1
+    model.lora_config = config
+    return applied_cnt > 0    

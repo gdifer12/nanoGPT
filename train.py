@@ -28,6 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+from lora import LoRAConfig, apply_LoRA, lora_config_to_dict, dict_to_lora_config
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -68,6 +69,13 @@ decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+# LoRA settings
+lora_enable = False
+lora_targets = "all" # from {attn.c_attn, attn.c_proj, mlp.c_fc, mlp.c_proj} divided by commas
+lora_target_layers = "all" # "all" or list of python-like slices through commas (example: "1,3:5,6:10:2,12" -> [1, 3, 4, 6, 8, 12])
+lora_rank = 8
+lora_alpha = 1.0 # scale is alpha/rank 
+lora_bias = False # if True do not freese bias on target (if exists and not freezed)
 # freeze settings
 freeze_n_layers = 0 # freeze first n layers in model.transformer.h
 freeze_embeddings = False # freeze wte and wpe, wte <=> lm_head 
@@ -148,7 +156,7 @@ if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
     meta_vocab_size = meta['vocab_size']
-    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")    
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
@@ -194,6 +202,12 @@ else:
     # create the model
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
+    
+    # applying old LoRA settings
+    old_lora = checkpoint.get('lora_config', None)
+    if old_lora:
+        apply_LoRA(model, dict_to_lora_config(old_lora))
+    
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -208,6 +222,15 @@ else:
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
+
+# LoRA config 
+lora_config = LoRAConfig(enable=lora_enable, targets=lora_targets, 
+                         target_layers=lora_target_layers, rank=lora_rank, alpha=lora_alpha, bias=lora_bias)
+# applying LoRA if enabled 
+stop_load_optimizer_state = (not lora_config.is_compatible(getattr(model, 'lora_config', None), model.config.n_layer))
+apply_LoRA(model, lora_config) 
+
+# after applying LoRA
 model.to(device)
 
 def apply_freeze(model, freeze_n_layers: int = 0, freeze_embeddings: bool = False):
@@ -228,7 +251,7 @@ def apply_freeze(model, freeze_n_layers: int = 0, freeze_embeddings: bool = Fals
     return (freeze_n_layers or freeze_embeddings)
 
 # appliying freeze
-stop_load_optimizer_state = apply_freeze(model, freeze_n_layers=freeze_n_layers, freeze_embeddings=freeze_embeddings)
+stop_load_optimizer_state = stop_load_optimizer_state or apply_freeze(model, freeze_n_layers=freeze_n_layers, freeze_embeddings=freeze_embeddings)
 
 trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 total = sum(p.numel() for p in model.parameters())
@@ -324,6 +347,7 @@ while True:
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                     'config': config,
+                    'lora_config': lora_config_to_dict(getattr(model, 'lora_config', None)),
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
