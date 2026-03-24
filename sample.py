@@ -7,6 +7,7 @@ from contextlib import nullcontext
 import torch
 import tiktoken
 from model import GPTConfig, GPT
+from lora import apply_LoRA, dict_to_lora_config
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
@@ -52,6 +53,12 @@ else:
     checkpoint = torch.load(ckpt_path, map_location=device)
     gptconf = GPTConfig(**checkpoint['model_args'])
     model = GPT(gptconf)
+    
+    # applying old LoRA settings
+    old_lora = checkpoint.get('lora_config', None)
+    if old_lora:
+        apply_LoRA(model, dict_to_lora_config(old_lora))
+    
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
     for k,v in list(state_dict.items()):
