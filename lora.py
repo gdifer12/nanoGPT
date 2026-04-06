@@ -19,13 +19,13 @@ class LoRAConfig:
     def is_compatible(self, o: 'LoRAConfig', n_layer: int) -> bool:
         if not o: return False
         if not self.enable and not o.enable: return True
-        return (
+        return all([
             self.enable == o.enable,
             self.targets == o.targets,
             _parse_target_layers(self.target_layers, n_layer) == _parse_target_layers(o.target_layers, n_layer),
             self.rank == o.rank,
             self.bias == o.bias,
-        )
+        ])
         
 def lora_config_to_dict(cfg: LoRAConfig | None) -> dict:
     if not cfg: return dict()
@@ -69,6 +69,12 @@ class LoRALinear(nn.Module):
     def forward(self, x):
         return self.w0(x) + self.scale * self.B(self.A(x))
 
+
+def _lora_linear_is_same_to_cfg(ln: LoRALinear, cfg: LoRAConfig):
+    return all([
+        ln.A.weight.shape[0] == cfg.rank,
+        not ln.w0.bias or ln.w0.bias.requires_grad >= cfg.bias,
+    ])
 
 def _parse_target_layers(target_layers: str, n_layer: int) -> list[int]:
     spec = target_layers.strip()
@@ -128,13 +134,18 @@ def apply_LoRA(model: GPT, config: LoRAConfig):
             parent = model.transformer.h[i].get_submodule(subpath)
             
             obj = getattr(parent, attr)
-            if isinstance(obj, LoRALinear):
-                print(f"LoRA is already applied to {target} on layer {i}")
-                continue
-            if not isinstance(obj, nn.Linear):
+            if not isinstance(obj, (nn.Linear, LoRALinear)):
                 raise ValueError(f"{target} on layer {i} in not a suitable object")
             
-            setattr(parent, attr, LoRALinear(obj, config))
+            if isinstance(obj, LoRALinear):
+                print(f"LoRA is already applied to {target} on layer {i}")
+                if _lora_linear_is_same_to_cfg(obj, config):
+                    obj.scale = config.alpha / config.rank
+                else:
+                    obj = LoRALinear(obj, config)
+            else:
+                obj = LoRALinear(obj, config)
+            setattr(parent, attr, obj)
             applied_cnt += 1
     model.lora_config = config
-    return applied_cnt > 0    
+    return applied_cnt > 0

@@ -42,6 +42,8 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 save_best_to_different = False # if True, save last eval as ckpt.pt, best as ckpt_best.pt
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+model_path = None # use only if init from 'resume', {out_dir}/ckpt.pt by default
+saving_mode = 'auto' # 'full' or 'adapter' or 'auto', full - save whole solid model, adapter - save only trainable weights, auto - full/adapter depend on settings
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -170,6 +172,9 @@ if init_from == 'scratch':
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
+    
+    base_model = None
+    saving_mode = 'full'
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
@@ -178,22 +183,17 @@ elif init_from.startswith('gpt2'):
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
-else:
-    if init_from == 'resume':
-        print(f"Resuming training from {out_dir}")
-        # resume training from a checkpoint.
-        ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    else:
-        # suppose path to ckpt.pt
-        if not os.path.exists(init_from) or not os.path.isfile(init_from):
-            print(f"Initial model not found on path: {init_from}")
-            exit(1)
-        else:
-            print(f"Resuming training from {init_from}")
-            ckpt_path = init_from
-            init_from = "resume"
+        
+    base_model = init_from
+elif init_from == 'resume':
+    if model_path is None:
+        model_path = os.path.join(out_dir, 'ckpt.pt')
+    if not os.path.exists(model_path) or not os.path.isfile(model_path):
+        print(f"Initial model not found on path: {model_path}")
+        exit(1)
+    print(f"Resuming training from {model_path}")
             
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint = torch.load(model_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
@@ -205,19 +205,45 @@ else:
     
     # applying old LoRA settings
     old_lora = checkpoint.get('lora_config', None)
-    if old_lora:
+    if old_lora is not None:
         apply_LoRA(model, dict_to_lora_config(old_lora))
     
+    def strip_prefix_inplace(state_dict, prefix="_orig_mod."):
+        for k, v in list(state_dict.items()):
+            if k.startswith(prefix):
+                state_dict[k[len(prefix):]] = state_dict.pop(k)    
+        
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
+    strip_prefix_inplace(state_dict)
+    
+    # if base model is adapter, here we have only adapter weights and whole optimizer
+    # need to get weights of base model
+    if checkpoint.get('checkpoint_kind', 'full') == 'adapter':
+        # TODO load from gpt2* unsupported
+        base_model_path = checkpoint['base_model']
+        if not os.path.exists(base_model_path) or not os.path.isfile(base_model_path):
+            print(f"Base model not found on path: {base_model_path}")
+            exit(1)
+        print(f"Loading waights from base: {base_model_path}")
+        
+        base_checkpoint = torch.load(base_model_path, map_location=device)
+        base_state_dict = base_checkpoint['model']
+        strip_prefix_inplace(base_state_dict)
+        model.load_state_dict(base_state_dict, strict=False)
+        model.load_state_dict(state_dict, strict=False)
+                
+        model_path = base_model_path
+    else:
+        model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+    
+    base_model = model_path
+else:
+    print(f'Unable to init from: {init_from}, can init from: scratch, resume, gpt2*')
+    exit(1)
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
@@ -306,6 +332,48 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
+is_adapter = (hasattr(model, 'lora_config') and model.lora_config.enable) or (freeze_n_layers or freeze_embeddings) 
+if saving_mode == 'auto':
+    saving_mode = 'adapter' if is_adapter else 'full'
+    
+def get_trainable_params(model): 
+    named_params = dict(model.named_parameters())
+    out = {}
+    for k, v in model.state_dict().items():
+        p = named_params.get(k)
+        if p is not None and p.requires_grad:
+            out[k] = v.detach().cpu()
+    return out
+
+def save_checkpoint(cur_is_best = True):
+    if saving_mode == 'full':
+        checkpoint = {
+            'checkpoint_kind': 'full',
+            'model': raw_model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'model_args': model_args,
+            'iter_num': iter_num,
+            'best_val_loss': best_val_loss,
+            'config': config,
+            'lora_config': lora_config_to_dict(getattr(raw_model, 'lora_config', None)),
+        }
+    else:
+        checkpoint = {
+            'checkpoint_kind': 'adapter',
+            'model': get_trainable_params(raw_model),
+            'optimizer': optimizer.state_dict(),
+            'model_args': model_args,
+            'iter_num': iter_num,
+            'best_val_loss': best_val_loss,
+            'config': config,
+            'lora_config': lora_config_to_dict(getattr(raw_model, 'lora_config', None)),
+            'base_model': base_model
+        }
+    print(f"saving checkpoint to {out_dir}")
+    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+    if save_best_to_different and cur_is_best:
+        torch.save(checkpoint, os.path.join(out_dir, 'ckpt_best.pt'))
+
 # logging
 if wandb_log and master_process:
     import wandb
@@ -338,21 +406,9 @@ while True:
             })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             cur_is_best = (losses['val'] < best_val_loss)
-            best_val_loss = losses['val']
+            best_val_loss = min(best_val_loss, losses['val'])
             if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                    'lora_config': lora_config_to_dict(getattr(model, 'lora_config', None)),
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-                if save_best_to_different and cur_is_best:
-                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt_best.pt'))
+                save_checkpoint(cur_is_best)
 
     if iter_num == 0 and eval_only:
         break
