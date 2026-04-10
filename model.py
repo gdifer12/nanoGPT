@@ -105,6 +105,19 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
+class TiedLMHead(nn.Module):
+
+    def __init__(self, embedding_module: nn.Module):
+        super().__init__()
+        self.embedding_module = embedding_module
+
+    @property
+    def weight(self):
+        return self.embedding_module.weight
+
+    def forward(self, x):
+        return F.linear(x, self.weight)
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -136,6 +149,7 @@ class GPT(nn.Module):
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        # to correctly load old checkpoints calc in forward will be replaced, but this rests
 
         # init all weights
         self.apply(self._init_weights)
@@ -183,11 +197,11 @@ class GPT(nn.Module):
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
+            logits = F.linear(x, self.transformer.wte.weight)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = F.linear(x[:, [-1], :], self.transformer.wte.weight) # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss

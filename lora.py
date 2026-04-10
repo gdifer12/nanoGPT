@@ -2,20 +2,23 @@
 
 from dataclasses import dataclass, asdict
 
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from model import GPT 
 
 @dataclass
 class LoRAConfig:
     enable: bool = False
-    targets: str = "" # all or subset of {attn.c_attn, attn.c_proj, mlp.c_fc, mlp.c_proj} divided by commas
+    targets: str = "" # all or subset of {attn.c_attn, attn.c_proj, mlp.c_fc, mlp.c_proj, wte, wpe} divided by commas
     target_layers: str = "all" # "all" or list of python-like slices through commas (example: "1,3:5,6:10:2,12" -> [1, 3, 4, 6, 8, 12])
     rank: int = 8
     alpha: float = 1.0 # scale is alpha/rank 
     bias: bool = False # if True do not freese bias on target (if exists and not freezed)
+    merge_weights: bool = True # merge weights when eval mode to fasten inference
 
-    # True if optimizer_state can be reused
+    # True if optimizer_state can be reused if apply o after self
     def is_compatible(self, o: 'LoRAConfig', n_layer: int) -> bool:
         if not o: return False
         if not self.enable and not o.enable: return True
@@ -48,7 +51,7 @@ class LoRALinear(nn.Module):
         
         unfreeze_bias = (config.bias and src.bias is not None and src.bias.requires_grad)
         
-        self.w0 = src
+        self.w0 = _to_Linear(src)
         self.w0.requires_grad_(False)
         if unfreeze_bias:
             self.w0.bias.requires_grad_(True)
@@ -57,24 +60,146 @@ class LoRALinear(nn.Module):
         self.B = nn.Linear(rank, src.out_features, bias=False)
 
         nn.init.zeros_(self.B.weight)
+        
+        self.merged = False
+        self.merge_weights = config.merge_weights
     
     @property
-    def bias(self):
-        return self.w0.bias
+    def in_features(self): return self.w0.in_features
+    @property
+    def out_features(self): return self.w0.out_features
+    @property
+    def bias(self): return self.w0.bias
     
     @property
     def weight(self):
-        return self.w0.weight + self.scale * (self.B.weight @ self.A.weight)
+        if self.merged: return self.w0.weight
+        return self.w0.weight + self.lora_delta_weight()
+
+    def lora_delta_weight(self) -> torch.Tensor:
+        return self.scale * (self.B.weight @ self.A.weight)
+
+    def train(self, mode = True):
+        super().train(mode)
+        with torch.no_grad():
+            if mode:
+                if self.merge_weights and self.merged:
+                    self.w0.weight.sub_(self.lora_delta_weight())
+                    self.merged = False
+            else:
+                if self.merge_weights and not self.merged:
+                    self.w0.weight.add_(self.lora_delta_weight())
+                    self.merged = True
 
     def forward(self, x):
+        if self.merged: return self.w0(x)
         return self.w0(x) + self.scale * self.B(self.A(x))
 
+# suppose src is using in this
+# only place and can modify it 
+def _to_Linear(src: LoRALinear | nn.Linear):
+    if not isinstance(src, (LoRALinear, nn.Linear)): raise TypeError(f"Can not convert {str(type(src))} to nn.Linear")
+    if not isinstance(src, LoRALinear): return src
+    with torch.no_grad():
+        src.w0.weight.add_(src.lora_delta_weight())
+    return src.w0
 
 def _lora_linear_is_same_to_cfg(ln: LoRALinear, cfg: LoRAConfig):
     return all([
         ln.A.weight.shape[0] == cfg.rank,
-        not ln.w0.bias or ln.w0.bias.requires_grad >= cfg.bias,
+        ln.w0.bias is None or ln.w0.bias.requires_grad >= cfg.bias,
     ])
+
+class LoRAEmbedding(nn.Module):
+    def __init__(self, src: nn.Embedding, config: LoRAConfig):
+        super().__init__()
+    
+        rank = config.rank
+        assert rank > 0
+        self.scale = config.alpha / rank
+        
+        self.src = _to_Embedding(src)
+        self.src.requires_grad_(False)
+        
+        self.A = nn.Embedding(
+            num_embeddings=self.num_embeddings, 
+            embedding_dim=rank,
+            padding_idx=self.padding_idx,
+            max_norm=None,
+            norm_type=self.norm_type,
+            scale_grad_by_freq=self.scale_grad_by_freq,
+            sparse=False)
+        self.B = nn.Linear(rank, self.embedding_dim, bias=False)
+
+        nn.init.zeros_(self.B.weight)
+        if self.padding_idx is not None:
+            with torch.no_grad():
+                self.A.weight[self.padding_idx].zero_()
+                
+        self.merged = False
+        self.merge_weights = config.merge_weights
+        
+    @property    
+    def num_embeddings(self): return self.src.num_embeddings
+    @property
+    def embedding_dim(self): return self.src.embedding_dim
+    @property
+    def padding_idx(self): return self.src.padding_idx
+    @property
+    def max_norm(self): return self.src.max_norm
+    @property
+    def norm_type(self): return self.src.norm_type
+    @property
+    def scale_grad_by_freq(self): return self.src.scale_grad_by_freq
+    @property
+    def sparse(self): return self.src.sparse
+
+    @property
+    def weight(self):
+        if self.merged:
+            return self.src.weight
+        return self.src.weight + self.lora_delta_weight()
+
+    def lora_delta_weight(self) -> torch.Tensor:
+        delta = self.A.weight @ self.B.weight.T
+
+        if self.padding_idx is not None:
+            delta = delta.clone()
+            delta[self.padding_idx].zero_()
+
+        return delta * self.scale
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.src.train(mode)
+        with torch.no_grad():
+            if mode:
+                if self.merge_weights and self.merged:
+                    self.src.weight.sub_(self.lora_delta_weight())
+                    self.merged = False
+            else:
+                if self.merge_weights and not self.merged:
+                    self.src.weight.add_(self.lora_delta_weight())
+                    self.merged = True
+
+    def forward(self, x):
+        if self.merged:
+            return self.src.forward(x)
+        base = self.src.forward(x)
+        
+        return base + self.B(self.A(x)) * self.scale
+
+def _to_Embedding(src: LoRAEmbedding | nn.Embedding):
+    if not isinstance(src, (LoRAEmbedding, nn.Embedding)): raise TypeError(f"Can not convert {str(type(src))} to nn.Embedding")
+    if not isinstance(src, LoRAEmbedding): return src
+    if not src.merged:
+        with torch.no_grad():
+            src.src.weight.add_(src.lora_delta_weight())
+    return src.src
+
+def _lora_embedding_same_to_cfg(src: LoRAEmbedding, cfg: LoRAConfig):
+    return src.A.embedding_dim == cfg.rank
+
 
 def _parse_target_layers(target_layers: str, n_layer: int) -> list[int]:
     spec = target_layers.strip()
@@ -110,6 +235,11 @@ def _parse_target_layers(target_layers: str, n_layer: int) -> list[int]:
     return layers
     
 TARGETS = {
+    "wte": "wte",
+    "wpe": "wpe",
+}
+    
+TARGETS_ON_LAYERS = {
     "attn.c_attn": ("attn", "c_attn"),
     "attn.c_proj": ("attn", "c_proj"),
     "mlp.c_fc":    ("mlp", "c_fc"),
@@ -118,19 +248,44 @@ TARGETS = {
 
 def apply_LoRA(model: GPT, config: LoRAConfig):
     if not config.enable:
-        return 0
+        return False
     layers = _parse_target_layers(config.target_layers, model.config.n_layer)
     if config.targets.strip() == "all":
-        targets = TARGETS.keys()    
+        targets = list(TARGETS.keys()) + list(TARGETS_ON_LAYERS.keys())
     else:
         targets = [x.strip() for x in config.targets.split(",") if x.strip()]
     applied_cnt = 0
+    
+    _targets = []
+    for target in targets:
+        if target in TARGETS:
+            attr = TARGETS[target]
+            parent = model.transformer
+            obj = getattr(parent, attr)
+            
+            if not isinstance(obj, (LoRAEmbedding, nn.Embedding)):
+                raise ValueError(f"{target} is not a suitable object")
+            if isinstance(obj, LoRAEmbedding):
+                print(f"LoRA is already applied to {target}")
+                if _lora_embedding_same_to_cfg(obj, config):
+                    obj.scale = config.alpha / config.rank
+                else:
+                    obj = LoRAEmbedding(obj, config)
+            else:
+                obj = LoRAEmbedding(obj, config)
+            
+            setattr(parent, attr, obj)
+            applied_cnt += 1
+        else:
+            _targets.append(target)
+    targets = _targets
+    
     for i in layers:
         for target in targets:
-            if target not in TARGETS:
+            if target not in TARGETS_ON_LAYERS:
                 raise ValueError(f"Unsupported target to apply LoRA: {target}")
             
-            subpath, attr = TARGETS[target]
+            subpath, attr = TARGETS_ON_LAYERS[target]
             parent = model.transformer.h[i].get_submodule(subpath)
             
             obj = getattr(parent, attr)

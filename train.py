@@ -73,11 +73,12 @@ lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # LoRA settings
 lora_enable = False
-lora_targets = "all" # from {attn.c_attn, attn.c_proj, mlp.c_fc, mlp.c_proj} divided by commas
+lora_targets = "all" # from {attn.c_attn, attn.c_proj, mlp.c_fc, mlp.c_proj, wte, wpe} divided by commas
 lora_target_layers = "all" # "all" or list of python-like slices through commas (example: "1,3:5,6:10:2,12" -> [1, 3, 4, 6, 8, 12])
 lora_rank = 8
 lora_alpha = 1.0 # scale is alpha/rank 
 lora_bias = False # if True do not freese bias on target (if exists and not freezed)
+lora_merge_weights = True # merge lora adapters to fassten inference in model.eval() mode, if True, saving checkpoint in eval mode will break model
 # freeze settings
 freeze_n_layers = 0 # freeze first n layers in model.transformer.h
 freeze_embeddings = False # freeze wte and wpe, wte <=> lm_head 
@@ -250,8 +251,8 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 
 # LoRA config 
-lora_config = LoRAConfig(enable=lora_enable, targets=lora_targets, 
-                         target_layers=lora_target_layers, rank=lora_rank, alpha=lora_alpha, bias=lora_bias)
+lora_config = LoRAConfig(enable=lora_enable, targets=lora_targets, target_layers=lora_target_layers, 
+                         rank=lora_rank, alpha=lora_alpha, bias=lora_bias, merge_weights=lora_merge_weights)
 # applying LoRA if enabled 
 stop_load_optimizer_state = (not lora_config.is_compatible(getattr(model, 'lora_config', None), model.config.n_layer))
 apply_LoRA(model, lora_config) 
