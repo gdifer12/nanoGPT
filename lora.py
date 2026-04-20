@@ -11,7 +11,7 @@ from model import GPT
 @dataclass
 class LoRAConfig:
     enable: bool = False
-    targets: str = "" # all or subset of {attn.c_attn, attn.c_proj, mlp.c_fc, mlp.c_proj, wte, wpe} divided by commas
+    targets: str = "" # "all", "all-linear" (all \ {wte, wpe}) or subset of {attn.c_attn, attn.c_proj, mlp.c_fc, mlp.c_proj, wte, wpe} divided by commas
     target_layers: str = "all" # "all" or list of python-like slices through commas (example: "1,3:5,6:10:2,12" -> [1, 3, 4, 6, 8, 12])
     rank: int = 8
     alpha: float = 1.0 # scale is alpha/rank 
@@ -252,6 +252,8 @@ def apply_LoRA(model: GPT, config: LoRAConfig):
     layers = _parse_target_layers(config.target_layers, model.config.n_layer)
     if config.targets.strip() == "all":
         targets = list(TARGETS.keys()) + list(TARGETS_ON_LAYERS.keys())
+    if config.targets.strip() == "all-linear":
+        targets = list(TARGETS_ON_LAYERS.keys())
     else:
         targets = [x.strip() for x in config.targets.split(",") if x.strip()]
     applied_cnt = 0
