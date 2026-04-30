@@ -73,7 +73,7 @@ lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # LoRA settings
 lora_enable = False
-lora_targets = "all-linear" # from {attn.c_attn, attn.c_proj, mlp.c_fc, mlp.c_proj, wte, wpe} divided by commas
+lora_targets = "all-linear" # "all", "all-linear", or from {attn.c_attn, attn.c_proj, mlp.c_fc, mlp.c_proj, wte, wpe} divided by commas
 lora_target_layers = "all" # "all" or list of python-like slices through commas (example: "1,3:5,6:10:2,12" -> [1, 3, 4, 6, 8, 12])
 lora_rank = 8
 lora_alpha = 1.0 # scale is alpha/rank 

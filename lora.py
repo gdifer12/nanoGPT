@@ -40,75 +40,118 @@ def dict_to_lora_config(d: dict | None) -> LoRAConfig:
     for attr, val in d.items():
         setattr(cfg, attr, val)
     return cfg
-        
+
+
+def _linear_in_features(src) -> int:
+    for name in ("in_features", "input_features"):
+        if hasattr(src, name):
+            return int(getattr(src, name))
+    raise TypeError(f"{type(src)} has no in/input features attribute")
+    
+def _linear_out_features(src) -> int:
+    for name in ("out_features", "output_features"):
+        if hasattr(src, name):
+            return int(getattr(src, name))
+    raise TypeError(f"{type(src)} has no out/output features attribute")
+
+def _linear_bias(src):
+    return getattr(src, "bias", None)
+
+# suppose to not use src enywhere else 
+def _to_linear_like(src):
+    if isinstance(src, LoRALinear):
+        if src.can_merge:
+            if not src.merged:
+                with torch.no_grad():
+                    src.base.weight.add_(src.lora_delta_weight())
+                src.base.merged = True
+            return src.base
+        else:
+            raise TypeError(f"Can't decide what to do with unmergeble different adapter")
+
+    if not hasattr(src, "forward"):
+        raise TypeError(f"{type(src)} is not callable as linear-like")
+    _linear_in_features(src)
+    _linear_out_features(src)
+    return src
+
+def _has_mergeable_dense_weight(src) -> bool:
+    w = getattr(src, "weight", None)
+    return (
+        isinstance(w, torch.Tensor)
+        and w.ndim == 2
+        and w.is_floating_point()
+    )
+
+
 class LoRALinear(nn.Module):
-    def __init__(self, src: nn.Linear, config: LoRAConfig):
+    def __init__(self, src, config: LoRAConfig):
         super().__init__()
         
         rank = config.rank
         assert rank > 0
         self.scale = config.alpha / rank
         
-        unfreeze_bias = (config.bias and src.bias is not None and src.bias.requires_grad)
+        bias = _linear_bias(src)
+        unfreeze_bias = (config.bias and bias is not None and bias.requires_grad)
         
-        self.w0 = _to_Linear(src)
-        self.w0.requires_grad_(False)
+        self.base = _to_linear_like(src)
+        self.base.requires_grad_(False)
         if unfreeze_bias:
-            self.w0.bias.requires_grad_(True)
+            bias.requires_grad_(True)
 
-        self.A = nn.Linear(src.in_features, rank, bias=False)
-        self.B = nn.Linear(rank, src.out_features, bias=False)
+        self.in_features = _linear_in_features(src)
+        self.out_features = _linear_out_features(src)
+
+        self.A = nn.Linear(self.in_features, rank, bias=False)
+        self.B = nn.Linear(rank, self.out_features, bias=False)
 
         nn.init.zeros_(self.B.weight)
         
         self.merged = False
+        self.can_merge = _has_mergeable_dense_weight(src)
         self.merge_weights = config.merge_weights
     
     @property
-    def in_features(self): return self.w0.in_features
-    @property
-    def out_features(self): return self.w0.out_features
-    @property
-    def bias(self): return self.w0.bias
-    
+    def bias(self):
+        return _linear_bias(self.base)
+        
     @property
     def weight(self):
-        if self.merged: return self.w0.weight
-        return self.w0.weight + self.lora_delta_weight()
+        if not self.can_merge:
+            raise RuntimeError(f"{type(self.base)} has no accessible dense weight")
+        if self.merged: return self.base.weight
+        return self.base.weight + self.lora_delta_weight()
 
     def lora_delta_weight(self) -> torch.Tensor:
         return self.scale * (self.B.weight @ self.A.weight)
 
     def train(self, mode = True):
         super().train(mode)
+        if not (self.merge_weights and self.can_merge):
+            return self
+        
         with torch.no_grad():
             if mode:
                 if self.merge_weights and self.merged:
-                    self.w0.weight.sub_(self.lora_delta_weight())
+                    self.base.weight.sub_(self.lora_delta_weight())
                     self.merged = False
             else:
                 if self.merge_weights and not self.merged:
-                    self.w0.weight.add_(self.lora_delta_weight())
+                    self.base.weight.add_(self.lora_delta_weight())
                     self.merged = True
+        return self
 
     def forward(self, x):
-        if self.merged: return self.w0(x)
-        return self.w0(x) + self.scale * self.B(self.A(x))
-
-# suppose src is using in this
-# only place and can modify it 
-def _to_Linear(src: LoRALinear | nn.Linear):
-    if not isinstance(src, (LoRALinear, nn.Linear)): raise TypeError(f"Can not convert {str(type(src))} to nn.Linear")
-    if not isinstance(src, LoRALinear): return src
-    with torch.no_grad():
-        src.w0.weight.add_(src.lora_delta_weight())
-    return src.w0
+        if self.merged: return self.base(x)
+        return self.base(x) + self.scale * self.B(self.A(x))
 
 def _lora_linear_is_same_to_cfg(ln: LoRALinear, cfg: LoRAConfig):
     return all([
         ln.A.weight.shape[0] == cfg.rank,
-        ln.w0.bias is None or ln.w0.bias.requires_grad >= cfg.bias,
+        ln.bias is None or ln.bias.requires_grad >= cfg.bias,
     ])
+
 
 class LoRAEmbedding(nn.Module):
     def __init__(self, src: nn.Embedding, config: LoRAConfig):
@@ -252,7 +295,7 @@ def apply_LoRA(model: GPT, config: LoRAConfig):
     layers = _parse_target_layers(config.target_layers, model.config.n_layer)
     if config.targets.strip() == "all":
         targets = list(TARGETS.keys()) + list(TARGETS_ON_LAYERS.keys())
-    if config.targets.strip() == "all-linear":
+    elif config.targets.strip() == "all-linear":
         targets = list(TARGETS_ON_LAYERS.keys())
     else:
         targets = [x.strip() for x in config.targets.split(",") if x.strip()]
@@ -291,11 +334,9 @@ def apply_LoRA(model: GPT, config: LoRAConfig):
             parent = model.transformer.h[i].get_submodule(subpath)
             
             obj = getattr(parent, attr)
-            if not isinstance(obj, (nn.Linear, LoRALinear)):
-                raise ValueError(f"{target} on layer {i} in not a suitable object")
             
             if isinstance(obj, LoRALinear):
-                print(f"LoRA is already applied to {target} on layer {i}")
+                print(f"Warning: LoRA is already applied to {target} on layer {i}")
                 if _lora_linear_is_same_to_cfg(obj, config):
                     obj.scale = config.alpha / config.rank
                 else:
