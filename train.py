@@ -115,7 +115,7 @@ if qlora_enable:
     if init_from == "scratch":
         raise ValueError("qLoRA requires pretrained/full base checkpoint, not scratch training")
     if device_type != "cuda":
-        raise ValueError("bitsandbytes qLoRA requires CUDA backend for the practical MVP")
+        print("WARNING: bitsandbytes qLoRA requires CUDA backend for the practical MVP")
     if saving_mode == 'full':
         raise ValueError("Can't save full checkpoint while apply qLoRA")
     lora_enable = True
