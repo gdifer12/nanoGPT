@@ -20,7 +20,7 @@ class LoRAConfig:
 
     # True if optimizer_state can be reused if apply o after self
     def is_compatible(self, o: 'LoRAConfig', n_layer: int) -> bool:
-        if not o: return False
+        if not o: return not self.enable
         if not self.enable and not o.enable: return True
         return all([
             self.enable == o.enable,
@@ -64,7 +64,7 @@ def _to_linear_like(src):
             if not src.merged:
                 with torch.no_grad():
                     src.base.weight.add_(src.lora_delta_weight())
-                src.base.merged = True
+                src.merged = True
             return src.base
         else:
             raise TypeError(f"Can't decide what to do with unmergeble different adapter")
@@ -110,7 +110,7 @@ class LoRALinear(nn.Module):
         
         self.merged = False
         self.can_merge = _has_mergeable_dense_weight(src)
-        self.merge_weights = config.merge_weights
+        self.merge_weights = config.merge_weights and self.can_merge
     
     @property
     def bias(self):

@@ -12,21 +12,26 @@ from model import GPT
 @dataclass
 class QuantConfig:
     enable: bool = False
-    mode: str = "none"          # none | int8 | nf4 | fp4
-    targets: str = "linear"     # linear | all-linear
+    mode: str = "nf4"          # int8 | nf4 | fp4
+    targets: str = "all-linear"     # 'all' (= 'all-linear')  or some from attn.c_attn, attn.c_proj, mlp.c_fc, mlp.c_proj
+    target_layers: str = "all"
     compute_dtype: str = "bfloat16"
     double_quant: bool = True
     quant_storage: str = "uint8"
     backend: str = "bitsandbytes"
     
     def is_compatible(self, o: 'QuantConfig', n_layer: int) -> bool:
-        if not o: return False
+        if not o: return not self.enable
         if not self.enable and not o.enable: return True
         return all([
+            self.enable == o.enable,
             self.mode == o.mode,
             self.targets == o.targets,
+            _parse_target_layers(self.target_layers, n_layer) == _parse_target_layers(o.target_layers, n_layer),
             self.compute_dtype == o.compute_dtype,
             self.double_quant == o.double_quant,
+            self.quant_storage == o.quant_storage,
+            self.backend == o.backend
         ])
 
 def quant_config_to_dict(cfg: QuantConfig | None) -> dict:
@@ -116,7 +121,7 @@ TARGETS = {
 }
 
 # apply to all model, if need to apply to certan layers use 'target_layers'
-def apply_quantizing(model: GPT, config: QuantConfig, target_layers: str|None=None) -> bool:
+def apply_quantizing(model: GPT, config: QuantConfig) -> bool:
     if not config.enable:
         return False
 
@@ -124,14 +129,12 @@ def apply_quantizing(model: GPT, config: QuantConfig, target_layers: str|None=No
         raise ValueError(f"Unsupported quantization backend: {config.backend}")
     bnb = _import_bitsandbytes()
 
-    if target_layers is None:
-        target_layers = "all"
-    layers = _parse_target_layers(target_layers, model.config.n_layer)
+    layers = _parse_target_layers(config.target_layers, model.config.n_layer)
 
-    if config.targets.strip() == "all":
+    if config.targets.strip() in ('all', 'all-linear'):
         targets = list(TARGETS.keys())
     else:
-        targets = [x.strip() for x in targets.split(",") if x.strip()]
+        targets = [x.strip() for x in config.targets.split(",") if x.strip()]
     
     applied_cnt = 0
 
@@ -158,7 +161,6 @@ def apply_quantizing(model: GPT, config: QuantConfig, target_layers: str|None=No
             
             obj = quantize_linear(obj, config)
             setattr(parent, attr, obj)
-            
             applied_cnt += 1
     model.quant_config = config
     return applied_cnt > 0

@@ -28,6 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+from quant import QuantConfig, freeze_base_model, apply_quantizing, quant_config_to_dict, dict_to_quant_config
 from lora import LoRAConfig, apply_LoRA, lora_config_to_dict, dict_to_lora_config
 
 # -----------------------------------------------------------------------------
@@ -79,7 +80,19 @@ lora_rank = 8
 lora_alpha = 1.0 # scale is alpha/rank 
 lora_bias = False # if True do not freese bias on target (if exists and not freezed)
 lora_merge_weights = True # merge lora adapters to fassten inference in model.eval() mode, if True, saving checkpoint in eval mode will break model
-# freeze settings
+# qLoRA settings
+qlora_enable = False
+# quantization settings
+quant_enable = False
+quant_mode = "nf4"
+quant_targets = "all-linear"
+quant_target_layers = "all"
+quant_compute_dtype = "bfloat16"
+quant_double = True
+quant_backend = "bitsandbytes"
+quant_storage = "uint8"
+quant_freeze_base = True
+# freeze settings (applys over quantization and LoRA)
 freeze_n_layers = 0 # freeze first n layers in model.transformer.h
 freeze_embeddings = False # freeze wte and wpe, wte <=> lm_head 
 detach_frozen_prefix = False # not realized yet
@@ -95,6 +108,21 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 always_save_checkpoint = True if save_best_to_different else always_save_checkpoint
+
+device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+
+if qlora_enable:
+    if init_from == "scratch":
+        raise ValueError("qLoRA requires pretrained/full base checkpoint, not scratch training")
+    if device_type != "cuda":
+        raise ValueError("bitsandbytes qLoRA requires CUDA backend for the practical MVP")
+    if saving_mode == 'full':
+        raise ValueError("Can't save full checkpoint while apply qLoRA")
+    lora_enable = True
+    lora_merge_weights = False
+    quant_enable = True
+    quant_freeze_base = True
+    saving_mode = 'adapter'
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -124,7 +152,6 @@ if master_process:
 torch.manual_seed(seed + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
@@ -190,11 +217,10 @@ elif init_from == 'resume':
     if model_path is None:
         model_path = os.path.join(out_dir, 'ckpt.pt')
     if not os.path.exists(model_path) or not os.path.isfile(model_path):
-        print(f"Initial model not found on path: {model_path}")
-        exit(1)
+        raise FileNotFoundError(f"Initial model not found on path: {model_path}")
     print(f"Resuming training from {model_path}")
-            
-    checkpoint = torch.load(model_path, map_location=device)
+    
+    checkpoint = torch.load(model_path, map_location="cpu" if quant_enable else device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
@@ -204,64 +230,103 @@ elif init_from == 'resume':
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     
-    # applying old LoRA settings
-    old_lora = checkpoint.get('lora_config', None)
-    if old_lora is not None:
-        apply_LoRA(model, dict_to_lora_config(old_lora))
+    old_quant = dict_to_quant_config(checkpoint.get('quant_config', None))
+    old_lora = dict_to_lora_config(checkpoint.get('lora_config', None))
     
+    # fix the keys of the state dictionary :(
+    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
     def strip_prefix_inplace(state_dict, prefix="_orig_mod."):
         for k, v in list(state_dict.items()):
             if k.startswith(prefix):
                 state_dict[k[len(prefix):]] = state_dict.pop(k)    
-        
+    
     state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
     strip_prefix_inplace(state_dict)
     
-    # if base model is adapter, here we have only adapter weights and whole optimizer
-    # need to get weights of base model
-    if checkpoint.get('checkpoint_kind', 'full') == 'adapter':
-        # TODO load from gpt2* unsupported
+    checkpoint_kind = checkpoint.get('checkpoint_kind', 'full')
+    if checkpoint_kind == 'full':
+        if old_quant.enable:
+            # на первом этапе я бы запретил full quant checkpoints
+            raise NotImplementedError("Full quantized checkpoints are not supported yet")
+
+        if old_lora.enable:
+            apply_LoRA(model, old_lora)
+        
+        model.load_state_dict(state_dict)
+        
+        base_model = model_path
+    else:
+        # TODO не работает если чекпоинт сохранён при init_from = "gpt2*"
         base_model_path = checkpoint['base_model']
         if not os.path.exists(base_model_path) or not os.path.isfile(base_model_path):
             print(f"Base model not found on path: {base_model_path}")
             exit(1)
         print(f"Loading waights from base: {base_model_path}")
         
+        
         base_checkpoint = torch.load(base_model_path, map_location=device)
         base_state_dict = base_checkpoint['model']
         strip_prefix_inplace(base_state_dict)
-        model.load_state_dict(base_state_dict, strict=False)
+        model.load_state_dict(base_state_dict, strict=True)
+        
+        if block_size < model.config.block_size:
+            model.crop_block_size(block_size)
+            model_args['block_size'] = block_size
+
+        if old_quant.enable:
+            freeze_base_model(model)
+            apply_quantizing(model, old_quant)
+
+        if old_lora.enable:
+            apply_LoRA(model, old_lora)
+
         model.load_state_dict(state_dict, strict=False)
-                
-        model_path = base_model_path
-    else:
-        model.load_state_dict(state_dict)
+        
+        base_model = base_model_path
+    
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
-    
-    base_model = model_path
 else:
-    print(f'Unable to init from: {init_from}, can init from: scratch, resume, gpt2*')
-    exit(1)
+    raise ValueError(f'Unable to init from: {init_from}, can init from: scratch, resume, gpt2*')
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 
-# LoRA config 
-lora_config = LoRAConfig(enable=lora_enable, targets=lora_targets, target_layers=lora_target_layers, 
-                         rank=lora_rank, alpha=lora_alpha, bias=lora_bias, merge_weights=lora_merge_weights)
-# applying LoRA if enabled 
-stop_load_optimizer_state = (not lora_config.is_compatible(getattr(model, 'lora_config', None), model.config.n_layer))
+# quantization config
+quant_config = QuantConfig(enable=quant_enable,
+                           mode=quant_mode,
+                           targets=quant_targets,
+                           target_layers=quant_target_layers,
+                           compute_dtype=quant_compute_dtype,
+                           double_quant=quant_double,
+                           quant_storage=quant_storage,
+                           backend=quant_backend)
 
-# TODO here is place to apply quantizing: 
-# decide if need to force merge previous lora adapter into base model 
+stop_load_optimizer_state = (not quant_config.is_compatible(getattr(model, 'quant_config', None), model.config.n_layer))
+
+# qLoRA: freeze base before adding adapters
+if quant_config.enable and quant_freeze_base and getattr(model, 'lora_config', None) is None:
+    frozen_params = freeze_base_model(model)
+    print(f"frozen base params: {frozen_params}")
+
+apply_quantizing(model, quant_config)
+
+# LoRA config 
+lora_config = LoRAConfig(enable=lora_enable,
+                         targets=lora_targets,
+                         target_layers=lora_target_layers,
+                         rank=lora_rank,
+                         alpha=lora_alpha,
+                         bias=lora_bias,
+                         merge_weights=lora_merge_weights)
+
+stop_load_optimizer_state = (stop_load_optimizer_state or 
+                             (not lora_config.is_compatible(getattr(model, 'lora_config', None), model.config.n_layer)))
 
 apply_LoRA(model, lora_config) 
 
-# after applying LoRA
+# after applying quantization and LoRA
 model.to(device)
 
 def apply_freeze(model, freeze_n_layers: int = 0, freeze_embeddings: bool = False):
@@ -351,29 +416,22 @@ def get_trainable_params(model):
     return out
 
 def save_checkpoint(cur_is_best = True):
+    checkpoint = {
+        'optimizer': optimizer.state_dict(),
+        'model_args': model_args,
+        'iter_num': iter_num,
+        'best_val_loss': best_val_loss,
+        'config': config,
+        'quant_config': quant_config_to_dict(getattr(raw_model, 'quant_config', None)),
+        'lora_config': lora_config_to_dict(getattr(raw_model, 'lora_config', None)),
+    }
     if saving_mode == 'full':
-        checkpoint = {
-            'checkpoint_kind': 'full',
-            'model': raw_model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'model_args': model_args,
-            'iter_num': iter_num,
-            'best_val_loss': best_val_loss,
-            'config': config,
-            'lora_config': lora_config_to_dict(getattr(raw_model, 'lora_config', None)),
-        }
+        checkpoint['checkpoint_kind'] = 'full'
+        checkpoint['model'] = raw_model.state_dict()
     else:
-        checkpoint = {
-            'checkpoint_kind': 'adapter',
-            'model': get_trainable_params(raw_model),
-            'optimizer': optimizer.state_dict(),
-            'model_args': model_args,
-            'iter_num': iter_num,
-            'best_val_loss': best_val_loss,
-            'config': config,
-            'lora_config': lora_config_to_dict(getattr(raw_model, 'lora_config', None)),
-            'base_model': base_model
-        }
+        checkpoint['checkpoint_kind'] = 'adapter'
+        checkpoint['model'] = get_trainable_params(raw_model)
+        checkpoint['base_model'] = base_model
     print(f"saving checkpoint to {out_dir}")
     torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if save_best_to_different and cur_is_best:
