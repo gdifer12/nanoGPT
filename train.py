@@ -84,14 +84,18 @@ lora_merge_weights = True # merge lora adapters to fassten inference in model.ev
 qlora_enable = False
 # quantization settings
 quant_enable = False
-quant_mode = "nf4"
+quant_freeze_base = True
+quant_mode = "int8"
 quant_targets = "all-linear"
 quant_target_layers = "all"
+quant_backend = "fake"
+# # backend = 'bitsandbytes'
 quant_compute_dtype = "bfloat16"
 quant_double = True
-quant_backend = "bitsandbytes"
 quant_storage = "uint8"
-quant_freeze_base = True
+# # backend = 'fake'
+quant_fake_weight_per_channel = True
+quant_fake_act_bits = 0  # 0 = disable activation fake quant
 # freeze settings (applys over quantization and LoRA)
 freeze_n_layers = 0 # freeze first n layers in model.transformer.h
 freeze_embeddings = False # freeze wte and wpe, wte <=> lm_head 
@@ -246,7 +250,6 @@ elif init_from == 'resume':
     checkpoint_kind = checkpoint.get('checkpoint_kind', 'full')
     if checkpoint_kind == 'full':
         if old_quant.enable:
-            # на первом этапе я бы запретил full quant checkpoints
             raise NotImplementedError("Full quantized checkpoints are not supported yet")
 
         if old_lora.enable:
@@ -298,14 +301,16 @@ quant_config = QuantConfig(enable=quant_enable,
                            mode=quant_mode,
                            targets=quant_targets,
                            target_layers=quant_target_layers,
+                           backend=quant_backend,
                            compute_dtype=quant_compute_dtype,
                            double_quant=quant_double,
                            quant_storage=quant_storage,
-                           backend=quant_backend)
+                           fake_weight_per_channel=quant_fake_weight_per_channel,
+                           fake_act_bits=quant_fake_act_bits)
 
 stop_load_optimizer_state = (not quant_config.is_compatible(getattr(model, 'quant_config', None), model.config.n_layer))
 
-# qLoRA: freeze base before adding adapters
+# qLoRA: freeze base before adding adapters (not freeze if frozen from checkpoint)
 if quant_config.enable and quant_freeze_base and getattr(model, 'lora_config', None) is None:
     frozen_params = freeze_base_model(model)
     print(f"frozen base params: {frozen_params}")
