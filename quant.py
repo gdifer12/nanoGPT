@@ -209,9 +209,10 @@ def quantize_linear(src: nn.Linear, config: QuantConfig) -> nn.Module:
     return dst
 
 
-def freeze_base_model(model: GPT) -> int:
+def freeze_base_model(model: GPT, only_linear: bool = True) -> int:
     cnt = 0
-    for p in model.parameters():
+    params = [p for l in model.transformer.h for p in l.parameters()] if only_linear else model.parameters()
+    for p in params:
         if p.requires_grad:
             p.requires_grad = False
             cnt += p.numel()
