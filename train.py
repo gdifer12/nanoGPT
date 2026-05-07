@@ -84,7 +84,7 @@ lora_merge_weights = True # merge lora adapters to fassten inference in model.ev
 qlora_enable = False
 # quantization settings
 quant_enable = False
-quant_freeze_base = True
+quant_freeze_base = 'auto' # True if qLoRA/quant enable and not overrided
 quant_mode = "int8"
 quant_targets = "all-linear"
 quant_target_layers = "all"
@@ -109,24 +109,30 @@ compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
-config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 always_save_checkpoint = True if save_best_to_different else always_save_checkpoint
-
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 
 if qlora_enable:
     if init_from == "scratch":
         raise ValueError("qLoRA requires pretrained/full base checkpoint, not scratch training")
-    if device_type != "cuda":
-        print("WARNING: bitsandbytes qLoRA requires CUDA backend for the practical MVP")
     if saving_mode == 'full':
         raise ValueError("Can't save full checkpoint while apply qLoRA")
     lora_enable = True
     lora_merge_weights = False
     quant_enable = True
-    quant_freeze_base = True
+    quant_freeze_base = True if quant_freeze_base == 'auto' else quant_freeze_base
     saving_mode = 'adapter'
+
+if quant_freeze_base == 'auto':
+    quant_freeze_base = True
+
+config = {k: globals()[k] for k in config_keys} # will be useful for logging
+# -----------------------------------------------------------------------------
+
+device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+
+if quant_enable and quant_backend == 'bitsandbytes' and device_type != "cuda":
+    print("WARNING: bitsandbytes (for quantization) requires CUDA backend for the practical MVP")
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
