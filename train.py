@@ -359,11 +359,12 @@ def apply_freeze(model, freeze_n_layers: int = 0, freeze_wte: bool = False, free
             
     return any((freeze_n_layers, freeze_wte, freeze_wpe))
 
+have_freezed_params = apply_freeze(model, 
+                                   freeze_n_layers=freeze_n_layers, 
+                                   freeze_wte=freeze_wte, 
+                                   freeze_wpe=freeze_wpe)
 # appliying freeze
-stop_load_optimizer_state = stop_load_optimizer_state or apply_freeze(model, 
-                                                                      freeze_n_layers=freeze_n_layers, 
-                                                                      freeze_wte=freeze_wte, 
-                                                                      freeze_wpe=freeze_wpe)
+stop_load_optimizer_state = stop_load_optimizer_state or have_freezed_params
 
 trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 total = sum(p.numel() for p in model.parameters())
