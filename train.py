@@ -357,7 +357,7 @@ def apply_freeze(model, freeze_n_layers: int = 0, freeze_wte: bool = False, free
         for p in model.transformer.h[i].parameters():
             p.requires_grad = False
             
-    return any(freeze_n_layers, freeze_wte, freeze_wpe)
+    return any((freeze_n_layers, freeze_wte, freeze_wpe))
 
 # appliying freeze
 stop_load_optimizer_state = stop_load_optimizer_state or apply_freeze(model, 
@@ -418,7 +418,7 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
-is_adapter = (hasattr(model, 'lora_config') and model.lora_config.enable) or any(freeze_n_layers, freeze_wte, freeze_wpe) 
+is_adapter = (hasattr(model, 'lora_config') and model.lora_config.enable) or any((freeze_n_layers, freeze_wte, freeze_wpe))
 if saving_mode == 'auto':
     saving_mode = 'adapter' if is_adapter else 'full'
     
