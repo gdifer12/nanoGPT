@@ -98,7 +98,8 @@ quant_fake_weight_per_channel = True
 quant_fake_act_bits = 0  # 0 = disable activation fake quant
 # freeze settings (applys over quantization and LoRA)
 freeze_n_layers = 0 # freeze first n layers in model.transformer.h
-freeze_embeddings = False # freeze wte and wpe, wte <=> lm_head 
+freeze_wte = False # <=> lm_head because of weight tying
+freeze_wpe = False
 detach_frozen_prefix = False # not realized yet
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
@@ -340,11 +341,12 @@ apply_LoRA(model, lora_config)
 # after applying quantization and LoRA
 model.to(device)
 
-def apply_freeze(model, freeze_n_layers: int = 0, freeze_embeddings: bool = False):
-    # embeddings (!weight tying -> wte <=> lm_head!)
-    if freeze_embeddings:
+def apply_freeze(model, freeze_n_layers: int = 0, freeze_wte: bool = False, freeze_wpe: bool = False):
+    # embeddings (weight tying -> wte <=> lm_head!)
+    if freeze_wte:
         for p in model.transformer.wte.parameters():
             p.requires_grad = False
+    if freeze_wpe:
         for p in model.transformer.wpe.parameters():
             p.requires_grad = False
 
@@ -355,10 +357,13 @@ def apply_freeze(model, freeze_n_layers: int = 0, freeze_embeddings: bool = Fals
         for p in model.transformer.h[i].parameters():
             p.requires_grad = False
             
-    return (freeze_n_layers or freeze_embeddings)
+    return any(freeze_n_layers, freeze_wte, freeze_wpe)
 
 # appliying freeze
-stop_load_optimizer_state = stop_load_optimizer_state or apply_freeze(model, freeze_n_layers=freeze_n_layers, freeze_embeddings=freeze_embeddings)
+stop_load_optimizer_state = stop_load_optimizer_state or apply_freeze(model, 
+                                                                      freeze_n_layers=freeze_n_layers, 
+                                                                      freeze_wte=freeze_wte, 
+                                                                      freeze_wpe=freeze_wpe)
 
 trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 total = sum(p.numel() for p in model.parameters())
@@ -413,7 +418,7 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
-is_adapter = (hasattr(model, 'lora_config') and model.lora_config.enable) or (freeze_n_layers or freeze_embeddings) 
+is_adapter = (hasattr(model, 'lora_config') and model.lora_config.enable) or any(freeze_n_layers, freeze_wte, freeze_wpe) 
 if saving_mode == 'auto':
     saving_mode = 'adapter' if is_adapter else 'full'
     
