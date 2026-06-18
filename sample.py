@@ -6,6 +6,7 @@ import pickle
 from contextlib import nullcontext
 import torch
 import tiktoken
+from loader import load_model
 from model import GPTConfig, GPT
 from quant import apply_quantizing, dict_to_quant_config
 from lora import apply_LoRA, dict_to_lora_config
@@ -35,35 +36,43 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # model
-if init_from.startswith('gpt2'):
-    # init from a given GPT-2 model
-    model = GPT.from_pretrained(init_from, dict(dropout=0.0))
-else:
-    if model_path is None:
-        model_path = os.path.join(out_dir, 'ckpt.pt')
-    if not os.path.exists(model_path) or not os.path.isfile(model_path):
-        raise FileNotFoundError(f"Initial model not found on path: {model_path}")
-    print(f"Resuming training from {model_path}")
-    checkpoint = torch.load(model_path, map_location=device)
-    gptconf = GPTConfig(**checkpoint['model_args'])
-    model = GPT(gptconf)
+# if init_from.startswith('gpt2'):
+#     # init from a given GPT-2 model
+#     model = GPT.from_pretrained(init_from, dict(dropout=0.0))
+# else:
+#     if model_path is None:
+#         model_path = os.path.join(out_dir, 'ckpt.pt')
+#     if not os.path.exists(model_path) or not os.path.isfile(model_path):
+#         raise FileNotFoundError(f"Initial model not found on path: {model_path}")
+#     print(f"Sampling from {model_path}")
+#     checkpoint = torch.load(model_path, map_location=device)
+#     gptconf = GPTConfig(**checkpoint['model_args'])
+#     model = GPT(gptconf)
     
-    # applying old quant settings
-    old_quant = checkpoint.get('quant_config', None)
-    if old_quant is not None:
-        apply_quantizing(model, dict_to_quant_config(old_quant))
+#     # applying old quant settings
+#     old_quant = checkpoint.get('quant_config', None)
+#     if old_quant is not None:
+#         apply_quantizing(model, dict_to_quant_config(old_quant))
     
-    # applying old LoRA settings
-    old_lora = checkpoint.get('lora_config', None)
-    if old_lora:
-        apply_LoRA(model, dict_to_lora_config(old_lora))
+#     # applying old LoRA settings
+#     old_lora = checkpoint.get('lora_config', None)
+#     if old_lora:
+#         apply_LoRA(model, dict_to_lora_config(old_lora))
     
-    state_dict = checkpoint['model']
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
+#     state_dict = checkpoint['model']
+#     unwanted_prefix = '_orig_mod.'
+#     for k,v in list(state_dict.items()):
+#         if k.startswith(unwanted_prefix):
+#             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+#     model.load_state_dict(state_dict)
+load_data = load_model(
+    init_from=init_from,
+    out_dir=out_dir,
+    device=device
+)
+
+model = load_data['model']
+checkpoint = load_data['checkpoint']
 
 model.eval()
 model.to(device)
