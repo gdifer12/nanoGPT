@@ -68,6 +68,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 load_data = load_model(
     init_from=init_from,
     out_dir=out_dir,
+    model_path=model_path,
     device=device
 )
 

@@ -308,6 +308,7 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
 load_data = load_model(
     init_from=init_from,
     out_dir=out_dir,
+    model_path=model_path,
     device=device,
     model_args=model_args,
     meta_vocab_size=meta_vocab_size,
@@ -321,7 +322,7 @@ load_data = load_model(
 
 model         = load_data['model']
 model_args    = load_data['model_args']
-checkpoint    = load_data['chekpoint']
+checkpoint    = load_data['checkpoint']
 base_model    = load_data['base_model']
 saving_mode   = load_data['saving_mode']
 iter_num      = load_data['iter_num']
@@ -366,7 +367,7 @@ apply_LoRA(model, lora_config)
 # after applying quantization and LoRA
 model.to(device)
 
-have_freezed_params = any((freeze_n_layers, freeze_wpe, freeze_wpe, freeze_ln_f))
+have_freezed_params = any((freeze_n_layers, freeze_wpe, freeze_wte, freeze_ln_f))
 
 def apply_freeze(
     model, 
@@ -400,7 +401,8 @@ apply_freeze(
     model, 
     freeze_n_layers=freeze_n_layers, 
     freeze_wte=freeze_wte, 
-    freeze_wpe=freeze_wpe
+    freeze_wpe=freeze_wpe,
+    freeze_ln_f=freeze_ln_f,
 )
 # appliying freeze
 stop_load_optimizer_state = stop_load_optimizer_state or have_freezed_params

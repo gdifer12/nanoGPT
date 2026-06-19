@@ -10,6 +10,7 @@ from lora import apply_LoRA, dict_to_lora_config
 def load_model(
     init_from: str = 'scratch', 
     out_dir: str | None = None,
+    model_path: str | None = None,
     device: str = 'cuda',
     model_args: dict | None = None,
     meta_vocab_size: int | None = None,
