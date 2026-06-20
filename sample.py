@@ -2,19 +2,21 @@
 Sample from a trained model
 """
 import os
+import json
 import pickle
 from contextlib import nullcontext
 import torch
 import tiktoken
 from loader import load_model
-from model import GPTConfig, GPT
-from quant import apply_quantizing, dict_to_quant_config
-from lora import apply_LoRA, dict_to_lora_config
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
-out_dir = 'out' # ignored if init_from is not 'resume'
+out_dir = 'out' # ignored if init_from is not 'resume' - artefact from train.py
 model_path = None
+output_path = None
+append_mode = True
+jsonify_output = False
+json_header = None
 start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 10 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
@@ -25,6 +27,10 @@ device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = False # use PyTorch 2.0 to compile the model to be faster
 exec(open('configurator.py').read()) # overrides from command line or config file
+if json_header is not None and not isinstance(json_header, dict):
+    json_header = json.loads(json_header)
+if json_header is None:
+    json_header = dict()
 # -----------------------------------------------------------------------------
 
 torch.manual_seed(seed)
@@ -36,35 +42,6 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # model
-# if init_from.startswith('gpt2'):
-#     # init from a given GPT-2 model
-#     model = GPT.from_pretrained(init_from, dict(dropout=0.0))
-# else:
-#     if model_path is None:
-#         model_path = os.path.join(out_dir, 'ckpt.pt')
-#     if not os.path.exists(model_path) or not os.path.isfile(model_path):
-#         raise FileNotFoundError(f"Initial model not found on path: {model_path}")
-#     print(f"Sampling from {model_path}")
-#     checkpoint = torch.load(model_path, map_location=device)
-#     gptconf = GPTConfig(**checkpoint['model_args'])
-#     model = GPT(gptconf)
-    
-#     # applying old quant settings
-#     old_quant = checkpoint.get('quant_config', None)
-#     if old_quant is not None:
-#         apply_quantizing(model, dict_to_quant_config(old_quant))
-    
-#     # applying old LoRA settings
-#     old_lora = checkpoint.get('lora_config', None)
-#     if old_lora:
-#         apply_LoRA(model, dict_to_lora_config(old_lora))
-    
-#     state_dict = checkpoint['model']
-#     unwanted_prefix = '_orig_mod.'
-#     for k,v in list(state_dict.items()):
-#         if k.startswith(unwanted_prefix):
-#             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-#     model.load_state_dict(state_dict)
 load_data = load_model(
     init_from=init_from,
     out_dir=out_dir,
@@ -100,17 +77,56 @@ else:
     encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
     decode = lambda l: enc.decode(l)
 
-# encode the beginning of the prompt
-if start.startswith('FILE:'):
-    with open(start[5:], 'r', encoding='utf-8') as f:
-        start = f.read()
-start_ids = encode(start)
-x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+def sampling(start: str, json_header: dict):
+    # encode the beginning of the prompt
+    if start.startswith('FILE:'):
+        with open(start[5:], 'r', encoding='utf-8') as f:
+            start = f.read()
+    start_ids = encode(start)
+    x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
-# run generation
-with torch.no_grad():
-    with ctx:
-        for k in range(num_samples):
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-            print(decode(y[0].tolist()))
-            print('---------------')
+    # run generation
+    res = [None] * num_samples
+    sep = '---------------'
+    with torch.no_grad():
+        with ctx:
+            for k in range(num_samples):
+                y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+                
+                cur = decode(y[0][len(start_ids):].tolist())
+                
+                if not jsonify_output:
+                    cur += f'\n{sep}'
+                    
+                res[k] = cur
+                
+                print(f'{cur}\n{sep}')
+                
+    if output_path is not None:
+        mode = "a" if append_mode else "w"
+        with open(output_path, mode) as f:
+            if jsonify_output:
+                for i in range(len(res)):
+                    text = res[i]
+                    res[i] = json_header
+                    res[i]['sample_id'] = i
+                    res[i]['generated_text'] = text
+                    res[i]['max_new_tokens'] = max_new_tokens
+                    res[i] = json.dumps(res[i])
+            res = '\n'.join(res)
+            f.write(res + '\n')
+
+if start.startswith('JSONFILE:'):
+    starts = []
+    with open(start[9:], 'r', encoding='utf-8') as f:
+        for s in f:
+            starts.append(json.loads(s))
+    if not append_mode:
+        with open(output_path, "w") as f:
+            append_mode = True
+    for s in starts:
+        t = dict(json_header)
+        t.update(s)
+        sampling(s['prompt'], t)
+else:
+    sampling(start, json_header)
