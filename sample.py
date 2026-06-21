@@ -16,7 +16,7 @@ model_path = ""
 output_path = ""
 append_mode = True
 jsonify_output = False
-json_header = ""
+json_header = {}
 start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 10 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
@@ -31,8 +31,6 @@ if not model_path:
     model_path = None
 if not output_path:
     output_path = None
-if not json_header:
-    json_header = dict()
 if not isinstance(json_header, dict):
     json_header = json.loads(json_header)
 # -----------------------------------------------------------------------------
