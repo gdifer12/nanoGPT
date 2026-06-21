@@ -12,7 +12,7 @@ from loader import load_model
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'out' # ignored if init_from is not 'resume' - artefact from train.py
-model_path = None
+model_path = ""
 output_path = None
 append_mode = True
 jsonify_output = False
@@ -27,6 +27,8 @@ device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = False # use PyTorch 2.0 to compile the model to be faster
 exec(open('configurator.py').read()) # overrides from command line or config file
+if not model_path:
+    model_path = None
 if not isinstance(json_header, dict):
     json_header = json.loads(json_header)
 # -----------------------------------------------------------------------------
