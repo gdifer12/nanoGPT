@@ -16,7 +16,7 @@ model_path = None
 output_path = None
 append_mode = True
 jsonify_output = False
-json_header = None
+json_header = {}
 start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 10 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
@@ -27,10 +27,8 @@ device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = False # use PyTorch 2.0 to compile the model to be faster
 exec(open('configurator.py').read()) # overrides from command line or config file
-if json_header is not None and not isinstance(json_header, dict):
+if not isinstance(json_header, dict):
     json_header = json.loads(json_header)
-if json_header is None:
-    json_header = dict()
 # -----------------------------------------------------------------------------
 
 torch.manual_seed(seed)
