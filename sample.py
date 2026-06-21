@@ -13,10 +13,10 @@ from loader import load_model
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'out' # ignored if init_from is not 'resume' - artefact from train.py
 model_path = ""
-output_path = None
+output_path = ""
 append_mode = True
 jsonify_output = False
-json_header = {}
+json_header = ""
 start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 10 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
@@ -29,6 +29,10 @@ compile = False # use PyTorch 2.0 to compile the model to be faster
 exec(open('configurator.py').read()) # overrides from command line or config file
 if not model_path:
     model_path = None
+if not output_path:
+    output_path = None
+if not json_header:
+    json_header = dict()
 if not isinstance(json_header, dict):
     json_header = json.loads(json_header)
 # -----------------------------------------------------------------------------
